@@ -8,8 +8,11 @@
 [[ -z $USE_WANDB ]] && USE_WANDB=True
 
 NETWORKS=(
+    HumanBaseTopGlobal
+    ConsensusPathDB
     BioGRID
-    HumanNet
+    SIGNOR
+    STRING
 )
 LABELS=(
     DisGeNET

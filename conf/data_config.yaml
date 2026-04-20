@@ -10,20 +10,11 @@ labels:
   - DisGeNET
   - DISEASES
 networks:
-  - STRING
-  - BioGRID
-  - HumanNet  # same as HumanNet-XC
+  - HumanBaseTopGlobal
   - ConsensusPathDB
-  - BioPlex
-  - ComPPIHumanInt
-  - FunCoup
-  - HIPPIE
-  - HuRI
-  - HuMAP
-  - OmniPath
-  - PCNet
-  - ProteomeHD
+  - BioGRID
   - SIGNOR
+  - STRING
 hydra:
   run:
     dir: ${paths.runtime_dir}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}

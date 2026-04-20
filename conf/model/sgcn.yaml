@@ -37,7 +37,6 @@ model:
   dropout: 0.2
   pred_head_layers: 1
   skip_pred_act: false   # sigmoid is applied inside SGCNModelModule
-  use_edge_feature: true # pass edge_weight to GCN conv
 
   post_prop:
     enable: false

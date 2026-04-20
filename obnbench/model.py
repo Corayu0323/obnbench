@@ -10,6 +10,7 @@ Changes vs. upstream krishnanlab/obnbench:
       subgraph sampling → local training → truncation → parameter aggregation.
 """
 
+import copy
 import math
 import os.path as osp
 import time
@@ -26,6 +27,7 @@ import torch.nn.functional as F
 import torch_geometric.nn as pygnn
 from omegaconf import DictConfig
 from torch_geometric.data import Data
+from torch_geometric.loader import GraphSAINTRandomWalkSampler
 from torch_geometric.utils import subgraph as pyg_subgraph
 
 import obnbench.metrics
@@ -982,6 +984,163 @@ class SGCNModelModule(ModelModule):
         return avg_loss
 
 
+# ─────────────────────────── GraphSAINT Lightning module ─────────────────────
+
+
+class GraphSAINTModelModule(ModelModule):
+    """Lightning module that trains using GraphSAINT random-walk mini-batches.
+
+    Inherits everything from ``ModelModule`` (feature encoder, MP layers built
+    from ``SGCNMPModule``, prediction head, metrics, validation / test steps,
+    logging) and overrides only ``training_step`` with GraphSAINT mini-batch
+    training:
+
+    1. Build (once, lazily) a ``GraphSAINTRandomWalkSampler`` from the full
+       graph received in the first ``training_step`` call.
+    2. Each epoch: iterate over ``num_steps`` SAINT mini-batches.  Each
+       mini-batch is an induced subgraph produced by random walks of length
+       ``walk_length`` starting from ``batch_size`` randomly chosen training
+       nodes.
+    3. For each mini-batch: run forward, compute BCE loss on the
+       ``train_mask`` nodes, and back-propagate.
+
+    GraphSAINT hyperparameters are read from ``cfg.model.saint.*``.  See
+    ``conf/model/GraphSAINT.yaml`` for default values and documentation.
+
+    Notes
+    -----
+    * Uses ``automatic_optimization = False`` so the inner mini-batch loop
+      is fully under our control.
+    * Gradient clipping (``cfg.trainer.gradient_clip_val``) is applied
+      manually via ``self.clip_gradients`` before each ``optimizer.step()``.
+    * The ``GraphSAINTRandomWalkSampler`` is created once (lazy init) and
+      reused across epochs for efficiency.  It is recreated automatically
+      if ``num_nodes`` or ``num_edges`` of the input graph change.
+    * Feature encoders that assume full-graph inputs (``AdjEmbBag``,
+      ``Embedding``) are **not** compatible with subgraph training.  Use
+      ``OneHotLogDeg``, ``SVD``, ``LapEigMap``, or similar encoders instead.
+    """
+
+    def __init__(self, cfg: DictConfig, node_ids: List[str], task_ids: List[str]):
+        super().__init__(cfg, node_ids, task_ids)
+
+        # Switch to manual optimization so we control the mini-batch loop
+        self.automatic_optimization = False
+
+        # Parse GraphSAINT-specific hyperparameters
+        saint_cfg: Dict[str, Any] = dict(cfg.model.get("saint") or {})
+        self._walk_length: int = int(saint_cfg.get("walk_length", 2))
+        self._batch_size_ratio: float = float(saint_cfg.get("batch_size_ratio", 0.1))
+        self._num_steps: int = int(saint_cfg.get("num_steps", 10))
+
+        # Lazily initialized sampler (built on first training_step call)
+        self._saint_loader: Optional[GraphSAINTRandomWalkSampler] = None
+        self._saint_graph_sig: Optional[tuple] = None  # (num_nodes, num_edges)
+
+    # ── forward helper (mirrors SGCNModelModule._forward_subgraph) ────────────
+
+    def _forward_subgraph(self, sub_batch: Data) -> torch.Tensor:
+        """Full model forward on *sub_batch*; returns sigmoid predictions."""
+        sub_batch = self.feature_encoder(sub_batch)
+        sub_batch = self.mp_layers(sub_batch)
+        sub_batch = self.pred_head(sub_batch)
+        return self.pred_act(sub_batch.x)  # sigmoid
+
+    # ── sampler construction ──────────────────────────────────────────────────
+
+    def _build_saint_loader(self, batch: Data) -> None:
+        """Create and cache a ``GraphSAINTRandomWalkSampler`` from *batch*.
+
+        *batch* is the full-graph Data object produced by obnbench's
+        full-batch DataLoader.  A shallow copy is made so that the sampler
+        works on CPU data without modifying the original batch.
+        ``train_mask`` is squeezed to 1-D as required by PyG's sampler.
+        """
+        n_train = int(batch.train_mask.squeeze(-1).sum().item())
+        batch_size = max(1, int(n_train * self._batch_size_ratio))
+
+        # Shallow-copy the Data object and move to CPU so the sampler can
+        # precompute its internal node-coverage statistics on CPU.
+        data_cpu = copy.copy(batch.cpu())
+        if data_cpu.train_mask.dim() == 2:
+            data_cpu.train_mask = data_cpu.train_mask.squeeze(-1)
+
+        self._saint_loader = GraphSAINTRandomWalkSampler(
+            data_cpu,
+            batch_size=batch_size,
+            walk_length=self._walk_length,
+            num_steps=self._num_steps,
+            num_workers=0,
+        )
+        self._saint_graph_sig = (batch.num_nodes, batch.num_edges)
+
+    # ── GraphSAINT training step ──────────────────────────────────────────────
+
+    def training_step(self, batch, *args, **kwargs):
+        """One GraphSAINT training epoch.
+
+        Receives the full graph as *batch* (obnbench's full-batch DataLoader
+        returns a single-graph Data each call).  The method:
+
+        1. Lazily builds ``GraphSAINTRandomWalkSampler`` on the first call.
+        2. Iterates over ``num_steps`` SAINT random-walk mini-batches.
+        3. For each mini-batch: forward → BCE loss on train nodes →
+           manual backward → (optional) gradient clip → optimizer step.
+        4. Logs ``train/loss``.
+        """
+        device = self.device
+        optimizer = self.optimizers()
+        clip_val = self.hparams.trainer.gradient_clip_val
+
+        # Lazy init (or rebuild if graph topology has changed)
+        graph_sig = (batch.num_nodes, batch.num_edges)
+        if self._saint_loader is None or self._saint_graph_sig != graph_sig:
+            self._build_saint_loader(batch)
+
+        loss_sum = 0.0
+        valid_batches = 0
+
+        self.train()
+        for saint_batch in self._saint_loader:
+            saint_batch = saint_batch.to(device)
+
+            train_mask = saint_batch.train_mask
+            # train_mask is already 1-D because _build_saint_loader squeezed it
+            # on the source Data before constructing the sampler.
+            if not train_mask.any():
+                continue
+
+            pred = self._forward_subgraph(saint_batch)
+            loss = F.binary_cross_entropy(
+                pred[train_mask], saint_batch.y[train_mask]
+            )
+
+            optimizer.zero_grad()
+            self.manual_backward(loss)
+            if clip_val:
+                self.clip_gradients(
+                    optimizer,
+                    gradient_clip_val=clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+            optimizer.step()
+
+            loss_sum += loss.item()
+            valid_batches += 1
+
+        avg_loss = loss_sum / valid_batches if valid_batches > 0 else 0.0
+
+        logger_opts = {
+            "on_step": False,
+            "on_epoch": True,
+            "logger": True,
+            "batch_size": batch.num_nodes,
+        }
+        self.log("train/loss", avg_loss, **logger_opts)
+
+        return avg_loss
+
+
 # ─────────────────────────── builder functions ───────────────────────────────
 
 
@@ -1019,8 +1178,8 @@ def build_feature_encoder(cfg: DictConfig):
 
 
 def build_mp_module(cfg: DictConfig):
-    # ── SGCN special case: bypass MPModule entirely ──────────────────────────
-    if cfg.model.mp_type == "SGCN":
+    # ── SGCN / GraphSAINT special case: both use SGCNMPModule ───────────────
+    if cfg.model.mp_type in ("SGCN", "GraphSAINT"):
         jk: bool = bool(cfg.model.get("jk") or False)
         return mp_layers.SGCNMPModule(
             dim=cfg.model.hid_dim,

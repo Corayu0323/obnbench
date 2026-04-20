@@ -1,0 +1,81 @@
+# @package _global_
+---
+# SGCN: Subgraph-based Graph Convolutional Network
+# Ported from Corayu0323/SGCN into obnbench.
+#
+# Usage (from the obnbench root):
+#   python main.py +model=sgcn dataset.network=<net> dataset.label=<lbl>
+#
+# Key SGCN hyperparameters are under model.sgcn.*
+# All other trainer / optim settings inherit from conf/config.yaml defaults.
+
+model:
+  name: SGCN
+
+  # ── architecture ──────────────────────────────────────────────────────────
+  hid_dim: 128
+  mp_type: SGCN          # triggers SGCNMPModule in build_mp_module()
+  mp_layers: 3           # number of GCN layers (original SGCN default)
+  mp_kwargs:
+    add_self_loops: false  # SGCN does not add self-loops
+    normalize: true        # degree-normalised adjacency (D^{-1/2} A D^{-1/2})
+    bias: true
+
+  # JK (Jumping Knowledge) sum aggregation over per-layer outputs.
+  # Set to true to match SGCN's --jk flag.
+  jk: false
+
+  # These fields are present for config-schema compatibility with other models.
+  # SGCNMPModule manages its own BatchNorm1d and ReLU internally, so these
+  # values are intentionally set to neutral / pass-through defaults.
+  residual_type: none    # handled inside SGCNMPModule
+  norm_type: none        # SGCNMPModule always uses BatchNorm1d per layer
+  norm_kwargs: null
+  act: relu              # for schema compatibility
+  act_first: false
+
+  dropout: 0.2
+  pred_head_layers: 1
+  skip_pred_act: false   # sigmoid is applied inside SGCNModelModule
+  use_edge_feature: true # pass edge_weight to GCN conv
+
+  post_prop:
+    enable: false
+  post_cands:
+    enable: false
+
+  # ── SGCN training algorithm ───────────────────────────────────────────────
+  sgcn:
+    # Number of independent subgraphs sampled each epoch.
+    # Set to 0 (or negative) to auto-derive from coverage constraint:
+    #   n_subgraphs = ceil(n_nodes / subgraph_max_nodes)
+    n_subgraphs: 5
+
+    # Local gradient steps per subgraph (L in the paper).
+    local_epochs: 5
+
+    # Subgraph sampling strategy.
+    # Options: random_node | random_edge | random_walk | snowball
+    subsampling_method: random_node
+
+    # Hard upper bound on nodes per subgraph.
+    # Set to 0 to fall back to the ratio-based budget (subgraph_ratio).
+    subgraph_max_nodes: 2048
+
+    # Hard upper bound on edges per subgraph.
+    # Excess edges are randomly dropped (with matching edge_weight values).
+    # Set to 0 to disable.
+    max_subgraph_edges: 0
+
+    # Fallback fractional node budget when subgraph_max_nodes <= 0.
+    subgraph_ratio: 0.5
+
+    # Fraction of worst-performing subgraphs to discard before aggregation.
+    # 0.0 = keep all;  0.2 = drop worst 20 % (paper default).
+    truncation_ratio: 0.2
+
+    # Parameter aggregation method after truncation.
+    # sgcn     – softmax-weighted by validation score (paper default)
+    # avg      – uniform equal-weight average
+    # weighted – linear normalization by shifted validation score
+    aggregation_method: sgcn

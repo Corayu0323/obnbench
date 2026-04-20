@@ -11,8 +11,8 @@ from obnb.dataset import OpenBiomedNetBenchPyG
 from omegaconf import DictConfig, OmegaConf
 
 from obnbench.data_module import DataModule
-# ── SGCN addition: import the new module alongside the original ───────────────
-from obnbench.model import ModelModule, SGCNModelModule
+# ── SGCN / GraphSAINT addition: import the new modules alongside the original ─
+from obnbench.model import ModelModule, SGCNModelModule, GraphSAINTModelModule
 # ─────────────────────────────────────────────────────────────────────────────
 from obnbench.preprocess import precompute_features, infer_dimensions
 from obnbench.utils import get_num_workers, replace_random_split
@@ -167,10 +167,13 @@ def main(cfg: DictConfig):
         with run_context(cfg):
             data = setup_data_module(cfg)
 
-            # ── SGCN routing: use SGCNModelModule when mp_type is 'SGCN' ─────
-            model_cls = (
-                SGCNModelModule if cfg.model.mp_type == "SGCN" else ModelModule
-            )
+            # ── Model routing ─────────────────────────────────────────────────
+            if cfg.model.mp_type == "SGCN":
+                model_cls = SGCNModelModule
+            elif cfg.model.mp_type == "GraphSAINT":
+                model_cls = GraphSAINTModelModule
+            else:
+                model_cls = ModelModule
             model = model_cls(cfg, node_ids=data.node_ids, task_ids=data.task_ids)
             # ─────────────────────────────────────────────────────────────────
 
@@ -184,10 +187,11 @@ def main(cfg: DictConfig):
                 check_val_every_n_epoch=cfg.trainer.eval_interval,
                 fast_dev_run=cfg.trainer.fast_dev_run,
                 gradient_clip_val=(
-                    # Disable Trainer-level gradient clipping for SGCN because
-                    # SGCNModelModule calls self.clip_gradients() manually inside
-                    # each local training step (manual_optimization=True).
-                    None if cfg.model.mp_type == "SGCN"
+                    # Disable Trainer-level gradient clipping for SGCN and
+                    # GraphSAINT because both modules call self.clip_gradients()
+                    # manually inside their training_step loops
+                    # (manual_optimization=True).
+                    None if cfg.model.mp_type in ("SGCN", "GraphSAINT")
                     else cfg.trainer.gradient_clip_val
                 ),
                 logger=loggers,

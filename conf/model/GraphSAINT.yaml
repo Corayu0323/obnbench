@@ -1,0 +1,57 @@
+# @package _global_
+---
+# GraphSAINT: Graph SAmpling-based INductive learning and Transfer
+# Uses PyG's GraphSAINTRandomWalkSampler for mini-batch subgraph training.
+# Serves as a baseline alongside SGCN in obnbench.
+#
+# Usage (from the obnbench root):
+#   python main.py +model=GraphSAINT dataset.network=<net> dataset.label=<lbl>
+#
+# GraphSAINT-specific hyperparameters are under model.saint.*
+# All other trainer / optim settings inherit from conf/config.yaml defaults.
+
+model:
+  name: GraphSAINT
+
+  # ── architecture (same GCNConv backbone as SGCN) ──────────────────────────
+  hid_dim: 128
+  mp_type: GraphSAINT      # triggers SGCNMPModule reuse in build_mp_module()
+  mp_layers: 3             # number of GCN layers (matches SGCN default)
+  mp_kwargs:
+    add_self_loops: false  # GraphSAINT does not add self-loops
+    normalize: true        # degree-normalised adjacency (D^{-1/2} A D^{-1/2})
+    bias: true
+
+  # JK (Jumping Knowledge) sum aggregation over per-layer outputs.
+  jk: false
+
+  # These fields are present for config-schema compatibility with other models.
+  # SGCNMPModule manages its own BatchNorm1d and ReLU internally, so these
+  # values are intentionally set to neutral / pass-through defaults.
+  residual_type: none    # handled inside SGCNMPModule
+  norm_type: none        # SGCNMPModule always uses BatchNorm1d per layer
+  norm_kwargs: null
+  act: relu              # for schema compatibility
+  act_first: false
+
+  dropout: 0.2
+  pred_head_layers: 1
+  skip_pred_act: false
+
+  post_prop:
+    enable: false
+  post_cands:
+    enable: false
+
+  # ── GraphSAINT training hyperparameters ───────────────────────────────────
+  saint:
+    # Random-walk length used by GraphSAINTRandomWalkSampler.
+    # Longer walks produce larger, denser subgraphs.
+    walk_length: 2
+
+    # Fraction of training nodes used as walk-root nodes per mini-batch.
+    # batch_size = max(1, int(n_train_nodes * batch_size_ratio))
+    batch_size_ratio: 0.1
+
+    # Number of SAINT mini-batches (subgraph samples) per training epoch.
+    num_steps: 10

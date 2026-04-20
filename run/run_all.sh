@@ -1,16 +1,9 @@
 NETWORKS=(
-    # Medium
+    HumanBaseTopGlobal
+    ConsensusPathDB
     BioGRID
-    HumanNet
-    ComPPIHumanInt
-    # Small
-    BioPlex
-    FunCoup
-    HuRI
-    OmniPath
-    PCNet
-    ProteomeHD
     SIGNOR
+    STRING
 )
 FEATURES=(
     Constant
@@ -50,7 +43,7 @@ LOGREGS=(
 sh run_main.sh
 
 # Tuned GNN experiments
-for network in BioGRID HumanNet; do
+for network in BioGRID; do
     for label in DisGeNET GOBP; do
         python main.py dataset.network=${network} dataset.label=${label} +model_tuned=${network}-${label}-GCN+tuned
         python main.py dataset.network=${network} dataset.label=${label} +model_tuned=${network}-${label}-GAT+tuned

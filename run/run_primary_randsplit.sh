@@ -8,8 +8,11 @@
 [[ -z $USE_WANDB ]] && USE_WANDB=True
 
 NETWORKS=(
+    HumanBaseTopGlobal
+    ConsensusPathDB
     BioGRID
-    HumanNet
+    SIGNOR
+    STRING
 )
 LABELS=(
     DisGeNET
@@ -74,16 +77,12 @@ launch() {
 
 # METHOD=GAT
 
-# launch BioGRID DisGeNET ${METHOD} && launch BioGRID GOBP ${METHOD} && launch HumanNet DisGeNET ${METHOD} && launch HumanNet GOBP ${METHOD}
+# launch BioGRID DisGeNET ${METHOD} && launch BioGRID GOBP ${METHOD}
 
 # launch BioGRID DisGeNET ${METHOD} &
 # launch BioGRID GOBP ${METHOD} &
-# launch HumanNet DisGeNET ${METHOD} &
-# launch HumanNet GOBP ${METHOD} &
 
 # launch BioGRID DisGeNET BioGRID-DisGeNET-${METHOD}+tuned &
 # launch BioGRID GOBP BioGRID-GOBP-${METHOD}+tuned &
-# launch HumanNet DisGeNET HumanNet-DisGeNET-${METHOD}+tuned &
-# launch HumanNet GOBP HumanNet-GOBP-${METHOD}+tuned &
 
 wait

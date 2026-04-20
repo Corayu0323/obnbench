@@ -8,8 +8,11 @@
 [[ -z $USE_WANDB ]] && USE_WANDB=True
 
 NETWORKS=(
+    HumanBaseTopGlobal
+    ConsensusPathDB
     BioGRID
-    HumanNet
+    SIGNOR
+    STRING
 )
 LABELS=(
     DisGeNET
@@ -64,11 +67,13 @@ for network in ${NETWORKS[@]}; do
         for model in ${MODELS[@]}; do
             launch $network $label $model
         done
+    done
+done
 
-        # Dataset-specific-tuned GNNs
-        for gnn in GCN GAT; do
-            launch $network $label ${network}-${label}-${gnn}+tuned
-        done
+# Dataset-specific-tuned GNNs (only for BioGRID which has tuned configs)
+for label in ${LABELS[@]}; do
+    for gnn in GCN GAT; do
+        launch BioGRID $label BioGRID-${label}-${gnn}+tuned
     done
 done
 

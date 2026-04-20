@@ -11,7 +11,9 @@ from obnb.dataset import OpenBiomedNetBenchPyG
 from omegaconf import DictConfig, OmegaConf
 
 from obnbench.data_module import DataModule
-from obnbench.model import ModelModule
+# ── SGCN addition: import the new module alongside the original ───────────────
+from obnbench.model import ModelModule, SGCNModelModule
+# ─────────────────────────────────────────────────────────────────────────────
 from obnbench.preprocess import precompute_features, infer_dimensions
 from obnbench.utils import get_num_workers, replace_random_split
 
@@ -115,12 +117,10 @@ def _patch_fix_scale_edge_weights(dataset, g):
 def setup_data_module(cfg: DictConfig):
     # Load data
     data_dir = cfg.paths.dataset_dir
-    # gene_list = np.loadtxt(cfg.paths.gene_list_path, dtype=str).tolist()
     dataset = OpenBiomedNetBenchPyG(
         data_dir,
         cfg.dataset.network,
         cfg.dataset.label,
-        # selected_genes=gene_list,
     )
 
     if cfg.dataset.random_split:
@@ -166,7 +166,14 @@ def main(cfg: DictConfig):
 
         with run_context(cfg):
             data = setup_data_module(cfg)
-            model = ModelModule(cfg, node_ids=data.node_ids, task_ids=data.task_ids)
+
+            # ── SGCN routing: use SGCNModelModule when mp_type is 'SGCN' ─────
+            model_cls = (
+                SGCNModelModule if cfg.model.mp_type == "SGCN" else ModelModule
+            )
+            model = model_cls(cfg, node_ids=data.node_ids, task_ids=data.task_ids)
+            # ─────────────────────────────────────────────────────────────────
+
             obnb.logger.info(f"Model constructed:\n{model}")
 
             # Set up data module and trainer
@@ -176,7 +183,13 @@ def main(cfg: DictConfig):
                 max_epochs=cfg.trainer.max_epochs,
                 check_val_every_n_epoch=cfg.trainer.eval_interval,
                 fast_dev_run=cfg.trainer.fast_dev_run,
-                gradient_clip_val=cfg.trainer.gradient_clip_val,
+                gradient_clip_val=(
+                    # Disable Trainer-level gradient clipping for SGCN because
+                    # SGCNModelModule calls self.clip_gradients() manually inside
+                    # each local training step (manual_optimization=True).
+                    None if cfg.model.mp_type == "SGCN"
+                    else cfg.trainer.gradient_clip_val
+                ),
                 logger=loggers,
                 callbacks=callbacks,
                 enable_progress_bar=True,

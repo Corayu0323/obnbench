@@ -115,9 +115,12 @@ def main(cfg: DictConfig):
     obnb.logger.info(f"Running with settings:\n{OmegaConf.to_yaml(cfg)}")
 
     datadir = cfg.paths.dataset_dir
-    gene_list_path = cfg.paths.gene_list_path
+    gene_list_path_base = cfg.paths.gene_list_path
+    if gene_list_path_base.endswith(".txt"):
+        gene_list_path_template = gene_list_path_base[:-4] + "_{network}.txt"
+    else:
+        gene_list_path_template = gene_list_path_base + "_{network}"
 
-    common_genes = None
     for network_name in cfg.networks:
         gcls, kwargs = get_network_construct(network_name)
         g = gcls(datadir, version=cfg.data_version, **kwargs)
@@ -126,23 +129,22 @@ def main(cfg: DictConfig):
             f"edge density = {g.num_edges / g.num_nodes / (g.num_nodes - 1):.4f}",
         )
 
-        if common_genes is None:
-            common_genes = set(g.node_ids)
-        else:
-            common_genes = common_genes.intersection(set(g.node_ids))
+        network_genes = sorted(g.node_ids)
+        gene_list_path = gene_list_path_template.format(network=network_name)
+        obnb.logger.info(
+            f"Exporting {len(network_genes):,} genes for {network_name} to {gene_list_path}"
+        )
+        with open(gene_list_path, "w") as f:
+            for gene in network_genes:
+                f.write(f"{gene}\n")
 
-    obnb.logger.info(f"Exporting {len(common_genes):,} common genes {gene_list_path}")
-    with open(gene_list_path, "w") as f:
-        for i in sorted(common_genes):
-            f.write(f"{i}\n")
+        splitter, filter_ = get_splitter_filter(datadir, gene_list_path)
+        for label_name in cfg.labels:
+            lsc = getattr(data, label_name)(datadir, transform=filter_,
+                                            version=cfg.data_version)
 
-    splitter, filter_ = get_splitter_filter(datadir, gene_list_path)
-    for label_name in cfg.labels:
-        lsc = getattr(data, label_name)(datadir, transform=filter_,
-                                        version=cfg.data_version)
-
-        obnb.logger.info(f"Start obtaining stats for {label_name}")
-        print_label_stats(lsc, splitter, common_genes)
+            obnb.logger.info(f"Start obtaining stats for {label_name} on {network_name}")
+            print_label_stats(lsc, splitter, network_genes)
 
 
 if __name__ == "__main__":

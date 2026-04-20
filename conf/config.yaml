@@ -59,7 +59,6 @@ model:
   act_first: false
   pred_head_layers: 1
   skip_pred_act: false
-  use_edge_feature: true
   post_prop:
     enable: false
     num_layers: 10

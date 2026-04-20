@@ -9,14 +9,11 @@ Changes vs. upstream krishnanlab/obnbench:
                              in model.py when ``cfg.model.mp_type == 'SGCN'``.
 """
 
-import warnings
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch_geometric.nn as pygnn
-
-# TODO: GAT/GINE edge attr mod bining
 
 
 # ─────────────────────────── original convolution wrappers ───────────────────
@@ -30,23 +27,18 @@ class BaseConvMixin:
         self,
         in_channels: int,
         out_channels: int,
-        use_edge_feature: bool = True,
         **kwargs,
     ):
         # Set up forward function depending on the edge usage capabilities
         # of the wrapped convolution module.
-        # Use simple (no-edge) forward when: the conv does not support edges,
-        # OR the caller explicitly opts out of edge features.
-        if self._edge_usage == "none" or not use_edge_feature:
+        if self._edge_usage == "none":
             self._forward = self._forward_simple
         elif self._edge_usage == "edge_weight":
             self._forward = self._forward_edgeweight
-        elif self._edge_usage == "edge_attr":
-            self._forward = self._forward_edgeattr
         else:
             raise ValueError(
                 f"Unknown edge usage mode {self._edge_usage!r}, "
-                "available options are: 'none', 'edge_weight', 'edge_attr'",
+                "available options are: 'none', 'edge_weight'",
             )
 
         super().__init__(in_channels, out_channels, **kwargs)
@@ -57,17 +49,6 @@ class BaseConvMixin:
     def _forward_edgeweight(self, batch):
         return super().forward(batch.x, batch.edge_index, edge_weight=batch.edge_weight)
 
-    def _forward_edgeattr(self, batch):
-        if (edge_attr := batch.edge_attr) is None:
-            warnings.warn(
-                "Implicitly use edge_attr in place of edge_weight because "
-                "edge_attr is unavailable.",
-                stacklevel=2,
-            )
-            # Try to use edge weight as attr if edge attr is unavailable
-            edge_attr = batch.edge_weight
-        return super().forward(batch.x, batch.edge_index, edge_attr=edge_attr)
-
     def forward(self, batch):
         batch.x = self._forward(batch)
         return batch
@@ -75,12 +56,12 @@ class BaseConvMixin:
 
 class GATConv(BaseConvMixin, pygnn.GATConv):
 
-    _edge_usage = "edge_attr"
+    _edge_usage = "none"
 
 
 class GATv2Conv(BaseConvMixin, pygnn.GATv2Conv):
 
-    _edge_usage = "edge_attr"
+    _edge_usage = "none"
 
 
 class GCNConv(BaseConvMixin, pygnn.GCNConv):
@@ -129,7 +110,6 @@ class PatchedGINEConv(pygnn.GINEConv):
         self,
         in_channels: int,
         out_channels: int,
-        use_edge_feature: bool = True,
         *,
         num_layers: int = 2,
         hidden_channels: Optional[int] = None,
@@ -152,7 +132,7 @@ class PatchedGINEConv(pygnn.GINEConv):
 
 class GINEConv(BaseConvMixin, PatchedGINEConv):
 
-    _edge_usage = "edge_attr"
+    _edge_usage = "none"
 
 
 class SAGEConv(BaseConvMixin, pygnn.SAGEConv):
@@ -182,20 +162,19 @@ class SGCNConv(BaseConvMixin, pygnn.GCNConv):
         self,
         in_channels: int,
         out_channels: int,
-        use_edge_feature: bool = True,
         **kwargs,
     ):
         kwargs.setdefault("add_self_loops", False)
         kwargs.setdefault("normalize", True)
-        super().__init__(in_channels, out_channels, use_edge_feature, **kwargs)
+        super().__init__(in_channels, out_channels, **kwargs)
 
 
 class SGCNMPModule(nn.Module):
     """Message-passing module implementing SGCN's residual-skip + optional JK.
 
     This module is a direct adaptation of ``GNN_PyG`` from the SGCN codebase,
-    rewritten to operate on obnbench's PyG ``Data`` batch objects (using scalar
-    ``edge_weight`` instead of multi-dimensional ``edge_attr``).
+    rewritten to operate on obnbench's PyG ``Data`` batch objects using scalar
+    ``edge_weight`` for the GCN convolution.
 
     Architecture per layer
     ----------------------
@@ -219,8 +198,6 @@ class SGCNMPModule(nn.Module):
         Number of GCN layers.
     dropout : float
         Dropout probability applied after each activation.
-    use_edge_feature : bool
-        If True, ``edge_weight`` is passed to the GCN convolution.
     jk : bool
         Enable Jumping Knowledge sum aggregation over all layer outputs.
     mp_kwargs : dict, optional
@@ -237,7 +214,6 @@ class SGCNMPModule(nn.Module):
         dim: int,
         num_layers: int,
         dropout: float = 0.0,
-        use_edge_feature: bool = True,
         jk: bool = False,
         mp_kwargs: Optional[Dict[str, Any]] = None,
     ):
@@ -251,7 +227,7 @@ class SGCNMPModule(nn.Module):
         _mp_kwargs.setdefault("normalize", True)
 
         self.convs = nn.ModuleList(
-            [SGCNConv(dim, dim, use_edge_feature, **_mp_kwargs) for _ in range(num_layers)]
+            [SGCNConv(dim, dim, **_mp_kwargs) for _ in range(num_layers)]
         )
         self.norms = nn.ModuleList(
             [nn.BatchNorm1d(dim) for _ in range(num_layers)]

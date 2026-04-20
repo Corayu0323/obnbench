@@ -457,7 +457,6 @@ class MPModule(nn.Module):
         act: str = "relu",
         act_first: bool = False,
         residual_type: str = "none",
-        use_edge_feature: bool = True,
         mp_kwargs: Optional[Dict[str, Any]] = None,
         norm_kwargs: Optional[Dict[str, Any]] = None,
     ):
@@ -489,17 +488,16 @@ class MPModule(nn.Module):
         self.res_norms = nn.ModuleList()
         mp_kwargs = mp_kwargs or {}
         for dim_in in self._layer_dims:
-            self._build_layer(mp_cls, dim_in, dim, use_edge_feature, mp_kwargs)
+            self._build_layer(mp_cls, dim_in, dim, mp_kwargs)
 
     def _build_layer(
         self,
         mp_cls: nn.Module,
         dim_in: int,
         dim_out: int,
-        use_edge_feature,
         mp_kwargs: Dict[str, Any],
     ) -> nn.Module:
-        conv_layer = mp_cls(dim_in, dim_out, use_edge_feature, **mp_kwargs)
+        conv_layer = mp_cls(dim_in, dim_out, **mp_kwargs)
         activation = act_register.get(self.act)()
         dropout = nn.Dropout(self.dropout)
 
@@ -1028,7 +1026,6 @@ def build_mp_module(cfg: DictConfig):
             dim=cfg.model.hid_dim,
             num_layers=cfg.model.mp_layers,
             dropout=cfg.model.dropout,
-            use_edge_feature=cfg.model.use_edge_feature,
             jk=jk,
             mp_kwargs=dict(cfg.model.mp_kwargs or {}),
         )
@@ -1044,7 +1041,6 @@ def build_mp_module(cfg: DictConfig):
         act=cfg.model.act,
         act_first=cfg.model.act_first,
         residual_type=cfg.model.residual_type,
-        use_edge_feature=cfg.model.use_edge_feature,
         mp_kwargs=cfg.model.mp_kwargs,
         norm_kwargs=cfg.model.norm_kwargs,
     )

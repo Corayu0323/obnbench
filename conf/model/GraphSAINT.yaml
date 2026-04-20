@@ -18,7 +18,7 @@ model:
   mp_type: GraphSAINT      # triggers SGCNMPModule reuse in build_mp_module()
   mp_layers: 3             # number of GCN layers (matches SGCN default)
   mp_kwargs:
-    add_self_loops: false  # GraphSAINT does not add self-loops
+    add_self_loops: false  # matching the SGCN implementation (design choice for this baseline)
     normalize: true        # degree-normalised adjacency (D^{-1/2} A D^{-1/2})
     bias: true
 

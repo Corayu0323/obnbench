@@ -1105,8 +1105,8 @@ class GraphSAINTModelModule(ModelModule):
             saint_batch = saint_batch.to(device)
 
             train_mask = saint_batch.train_mask
-            if train_mask.dim() == 2:
-                train_mask = train_mask.squeeze(-1)
+            # train_mask is already 1-D because _build_saint_loader squeezed it
+            # on the source Data before constructing the sampler.
             if not train_mask.any():
                 continue
 

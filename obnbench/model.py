@@ -826,12 +826,12 @@ class SGCNModelModule(ModelModule):
         # Track which nodes have been visited this epoch so that successive
         # samplers prioritise unvisited regions (full-graph coverage).
         epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool)
-        result: List[Tuple[torch.Tensor, Data]] = []
+        subgraphs: List[Tuple[torch.Tensor, Data]] = []
 
         for _ in range(n_subgraphs):
             # Bias sampler toward unvisited nodes for better coverage
             unsampled = epoch_sampled_mask.logical_not().nonzero(as_tuple=False).squeeze(1)
-            unsampled_nodes = unsampled if len(unsampled) > 0 else None
+            unsampled_nodes = unsampled if unsampled.numel() > 0 else None
 
             node_idx = _sample_subgraph_nodes(
                 edge_index_cpu,
@@ -859,9 +859,9 @@ class SGCNModelModule(ModelModule):
             if not sub_batch.train_mask.squeeze(-1).any():
                 continue  # skip subgraphs with no training nodes
 
-            result.append((node_idx, sub_batch))
+            subgraphs.append((node_idx, sub_batch))
 
-        return result
+        return subgraphs
 
     def train_local_model(
         self,
@@ -1015,6 +1015,10 @@ class SGCNModelModule(ModelModule):
             Aggregated state dict θ̃^(t) (CPU tensors, same dtypes as input).
         """
         # ── Truncation: keep top (1 − truncation_ratio) subgraphs ────────────
+        # n_keep is clamped to at least 1 so that aggregation always has
+        # something to work with.  A truncation_ratio of 1.0 (discard all) is
+        # treated as "keep the single best subgraph" rather than triggering a
+        # degenerate empty aggregation.
         n_keep = max(1, int(len(local_states) * (1.0 - self._truncation_ratio)))
         kept_idx = sorted(
             range(len(val_scores)), key=lambda i: val_scores[i], reverse=True

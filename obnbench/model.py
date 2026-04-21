@@ -5,9 +5,27 @@ Changes vs. upstream krishnanlab/obnbench:
     ``cfg.model.mp_type == 'SGCN'``, bypassing the generic ``MPModule``.
   • Added module-level SGCN constants and ``_sample_subgraph_nodes`` helper
     (ported from SGCN ``src/train.py``).
-  • Added ``SGCNModelModule(ModelModule)`` – a Lightning module that overrides
-    ``training_step`` with the full SGCN algorithm:
-      subgraph sampling → local training → truncation → parameter aggregation.
+  • Added ``SGCNModelModule(ModelModule)`` – a Lightning module that implements
+    the full SGCN algorithm as a multi-subgraph, multi-model training and
+    parameter aggregation framework:
+
+      For each epoch:
+        Stage 1 – Local training:
+          Sample R subgraphs from the full graph (dynamic, per-epoch).
+          For each subgraph:
+            - Initialize local model from global parameters θ̃^(t-1).
+            - Train locally for L gradient steps → local parameters θ̂_r.
+            - Score on a held-out validation mini-batch → s_r.
+        Stage 2 – Parameter aggregation:
+          Discard the bottom ``truncation_ratio`` fraction of subgraphs (by s_r).
+          Aggregate kept local parameters:
+            θ̃^(t) = Σ w_r * θ̂_r,  w_r ∝ s_r  (softmax / uniform / linear).
+
+    The four core stages are exposed as named, testable methods:
+      sample_subgraphs()      – dynamic subgraph sampling with coverage tracking
+      train_local_model()     – local gradient descent on a single subgraph
+      evaluate_submodel()     – validation quality score for a local model
+      aggregate_parameters()  – truncation + weighted parameter aggregation
 """
 
 import copy
@@ -16,7 +34,7 @@ import os.path as osp
 import time
 from collections import OrderedDict
 from math import ceil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightning.pytorch as pl
 import obnb
@@ -639,21 +657,31 @@ class PredictionHeadModule(nn.Module):
 
 
 class SGCNModelModule(ModelModule):
-    """Lightning module that trains using SGCN's subgraph-sampling algorithm.
+    """Lightning module implementing SGCN's multi-subgraph training algorithm.
 
-    Inherits everything from ``ModelModule`` (feature encoder, MP layers built
-    from ``SGCNMPModule``, prediction head, metrics, validation / test steps,
-    logging) and overrides only ``training_step`` with the full SGCN epoch:
+    SGCN is NOT a standard GCN trained on a fixed graph.  It is a
+    multi-subgraph, multi-model training framework with parameter-level
+    aggregation (analogous to federated averaging / ensemble distillation).
 
-    1. Sample *R* independent subgraphs (using one of four strategies).
-    2. For each subgraph: reset model to epoch-start state, run *L* local
-       gradient steps, score on a held-out val mini-batch.
-    3. Discard the bottom ``truncation_ratio`` fraction by validation score
-       (truncation mechanism).
-    4. Aggregate the remaining local parameter dicts according to
-       ``aggregation_method`` (softmax / uniform / linear-weighted).
-    5. Load the aggregated state into the model and clear stale optimizer
-       momentum.
+    Algorithm (per epoch t)
+    -----------------------
+    Stage 1 – Local training on R independent subgraphs:
+      For r = 1 … R:
+        1. Sample subgraph G_r from the full graph (dynamic, per epoch).
+        2. Initialize a local model from the current global parameters θ̃^(t-1).
+        3. Train for L gradient steps on G_r  →  local parameters θ̂_r^(t).
+        4. Evaluate local model quality on a validation mini-batch  →  score s_r^(t).
+
+    Stage 2 – Global parameter aggregation:
+        5. Discard the bottom ``truncation_ratio`` fraction of subgraphs (by s_r).
+        6. Compute weighted average of kept local parameters:
+             θ̃^(t) = Σ w_r * θ̂_r^(t),   w_r ∝ s_r^(t)
+
+    The four core operations are exposed as named, independently testable methods:
+      ``sample_subgraphs()``     – dynamic per-epoch subgraph sampling
+      ``train_local_model()``    – local gradient descent on a single subgraph
+      ``evaluate_submodel()``    – validation quality score for a local model
+      ``aggregate_parameters()`` – truncation + weighted parameter aggregation
 
     SGCN hyperparameters are read from ``cfg.model.sgcn.*``.  See
     ``conf/model/sgcn.yaml`` for default values and documentation.
@@ -691,7 +719,7 @@ class SGCNModelModule(ModelModule):
         self._truncation_ratio: float = float(sgcn_cfg.get("truncation_ratio", 0.2))
         self._aggregation_method: str = sgcn_cfg.get("aggregation_method", "sgcn")
 
-    # ── subgraph helpers ──────────────────────────────────────────────────────
+    # ── low-level helpers (subgraph construction + forward) ──────────────────
 
     def _make_sub_batch(self, batch, node_idx: torch.Tensor) -> Data:
         """Slice *batch* to the nodes in *node_idx* and return a new Data object.
@@ -753,25 +781,187 @@ class SGCNModelModule(ModelModule):
         sub_batch = self.pred_head(sub_batch)
         return self.pred_act(sub_batch.x)  # sigmoid
 
-    def _score_val_subgraph(
+    # ── Stage 1 helpers: subgraph sampling + local training ───────────────────
+
+    def sample_subgraphs(
         self,
-        batch,
+        batch: Data,
+        n_subgraphs: int,
+        n_sample: int,
+        edge_index_cpu: torch.Tensor,
+        train_idx_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> List[Tuple[torch.Tensor, Data]]:
+        """Sample *n_subgraphs* independent subgraphs from the full graph.
+
+        Implements epoch-level coverage tracking: successive samplers are
+        biased toward nodes not yet visited this epoch, so the union of all
+        sampled subgraphs covers the full graph before revisiting any region.
+
+        Each candidate subgraph is checked for training nodes; subgraphs that
+        contain none are silently skipped.
+
+        Parameters
+        ----------
+        batch : Data
+            Full-graph Data object.
+        n_subgraphs : int
+            Number of subgraphs to sample.
+        n_sample : int
+            Target node budget per subgraph.
+        edge_index_cpu : LongTensor
+            ``batch.edge_index`` pre-moved to CPU (avoids repeated transfers).
+        train_idx_cpu : LongTensor
+            Sorted training-node indices on CPU.
+        device : torch.device
+            Device on which the returned ``sub_batch`` tensors live.
+
+        Returns
+        -------
+        list of (node_idx, sub_batch)
+            ``node_idx`` is a 1-D CPU LongTensor of sampled node indices.
+            ``sub_batch`` is the corresponding induced-subgraph Data on *device*.
+        """
+        n_nodes = batch.num_nodes
+        # Track which nodes have been visited this epoch so that successive
+        # samplers prioritise unvisited regions (full-graph coverage).
+        epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool)
+        result: List[Tuple[torch.Tensor, Data]] = []
+
+        for _ in range(n_subgraphs):
+            # Bias sampler toward unvisited nodes for better coverage
+            unsampled = epoch_sampled_mask.logical_not().nonzero(as_tuple=False).squeeze(1)
+            unsampled_nodes = unsampled if len(unsampled) > 0 else None
+
+            node_idx = _sample_subgraph_nodes(
+                edge_index_cpu,
+                n_nodes,
+                train_idx_cpu,
+                self._subsampling_method,
+                n_sample,
+                subgraph_max_nodes=self._subgraph_max_nodes,
+                unsampled_nodes=unsampled_nodes,
+            )
+
+            # Guarantee at least a few training nodes are present in the subgraph
+            if not torch.isin(node_idx, train_idx_cpu).any():
+                extra = train_idx_cpu[
+                    torch.randperm(len(train_idx_cpu))[
+                        : min(_SGCN_MIN_TRAIN_NODES, len(train_idx_cpu))
+                    ]
+                ]
+                node_idx = torch.cat([node_idx, extra]).unique().sort().values
+
+            epoch_sampled_mask[node_idx] = True
+
+            # Build the induced subgraph and move to target device
+            sub_batch = self._make_sub_batch(batch, node_idx).to(device)
+            if not sub_batch.train_mask.squeeze(-1).any():
+                continue  # skip subgraphs with no training nodes
+
+            result.append((node_idx, sub_batch))
+
+        return result
+
+    def train_local_model(
+        self,
+        sub_batch: Data,
+        optimizer,
+        epoch_init_state: Dict[str, torch.Tensor],
+        clip_val: Optional[float],
+    ) -> Tuple[Dict[str, torch.Tensor], float]:
+        """Train a fresh local model on a single subgraph for L gradient steps.
+
+        This implements the per-subgraph local training stage of SGCN:
+          - Reset the model to the current global parameters θ̃^(t-1).
+          - Run ``_local_epochs`` gradient steps on *sub_batch*.
+          - Return the resulting local parameters θ̂_r and the final loss.
+
+        Parameters
+        ----------
+        sub_batch : Data
+            Induced subgraph Data object (already on the target device).
+        optimizer : torch.optim.Optimizer
+            The Lightning-managed optimizer (accessed via ``self.optimizers()``).
+        epoch_init_state : dict
+            CPU copy of the global parameters θ̃^(t-1) snapshotted at epoch start.
+        clip_val : float or None
+            Gradient-norm clipping threshold; ``None`` disables clipping.
+
+        Returns
+        -------
+        local_state : dict
+            CPU copy of the model's state dict after local training (θ̂_r).
+        last_loss : float
+            Training loss on the final local gradient step.
+        """
+        device = self.device
+        train_mask_sub = sub_batch.train_mask.squeeze(-1)
+
+        # Initialize local model from global parameters θ̃^(t-1)
+        self.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
+        optimizer.state.clear()  # discard stale momentum from previous subgraph
+        self.train()
+
+        last_loss = 0.0
+        for _ in range(self._local_epochs):
+            pred = self._forward_subgraph(sub_batch)
+            loss = F.binary_cross_entropy(pred[train_mask_sub], sub_batch.y[train_mask_sub])
+            optimizer.zero_grad()
+            self.manual_backward(loss)
+            if clip_val:
+                self.clip_gradients(
+                    optimizer,
+                    gradient_clip_val=clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+            optimizer.step()
+            last_loss = loss.item()
+
+        # Capture local parameters θ̂_r (CPU copy to free GPU memory)
+        local_state = {k: v.clone().cpu() for k, v in self.state_dict().items()}
+        return local_state, last_loss
+
+    # ── Stage 1 helper: subgraph quality scoring ──────────────────────────────
+
+    def evaluate_submodel(
+        self,
+        batch: Data,
         node_idx: torch.Tensor,
         val_idx_cpu: torch.Tensor,
         val_sample_size: int,
         device: torch.device,
     ) -> float:
-        """Return a validation-loss quality score for the local model.
+        """Return a validation quality score s_r for the current local model.
 
-        A random subset of validation nodes is augmented into the training
-        subgraph so that the GCN can use their neighbourhood context.
-        The score is ``-BCE_loss`` (higher = better), used for truncation.
+        A random subset of validation nodes is merged into the training
+        subgraph so that the GCN can use their neighbourhood context during
+        inference.  The score is ``-BCE_loss`` (higher = better) and is used
+        to rank subgraphs for truncation.
+
+        Parameters
+        ----------
+        batch : Data
+            Full-graph Data object (for neighbourhood context).
+        node_idx : LongTensor
+            CPU node indices of the training subgraph G_r.
+        val_idx_cpu : LongTensor
+            Sorted validation-node indices on CPU.
+        val_sample_size : int
+            Number of validation nodes to sample for the quality estimate.
+        device : torch.device
+            Device on which the model currently lives.
+
+        Returns
+        -------
+        float
+            Validation quality score s_r = −BCE_loss (higher is better).
         """
         self.eval()
         with torch.no_grad():
-            val_sample = val_idx_cpu[
-                torch.randperm(len(val_idx_cpu))[:val_sample_size]
-            ]
+            # Sample a random validation mini-batch for the quality estimate
+            val_sample = val_idx_cpu[torch.randperm(len(val_idx_cpu))[:val_sample_size]]
+            # Augment the subgraph with validation nodes for neighbourhood context
             eval_node_idx = torch.cat([node_idx, val_sample]).unique().sort().values
             eval_sub = self._make_sub_batch(batch, eval_node_idx).to(device)
 
@@ -782,29 +972,56 @@ class SGCNModelModule(ModelModule):
                 pred_eval[val_local_mask],
                 eval_sub.y[val_local_mask],
             )
-            val_score = -val_loss.item()  # higher is better
+            score = -val_loss.item()  # negate so that higher score = better model
 
         self.train()
-        return val_score
+        return score
 
-    def _aggregate_states(
+    # ── Stage 2: parameter aggregation ───────────────────────────────────────
+
+    def aggregate_parameters(
         self,
         epoch_init_state: Dict[str, torch.Tensor],
         local_states: List[Dict[str, torch.Tensor]],
         val_scores: List[float],
-        kept_idx: List[int],
     ) -> Dict[str, torch.Tensor]:
-        """Weighted average of the kept local state dicts.
+        """Aggregate local model parameters into new global parameters θ̃^(t).
 
-        Aggregation methods
-        -------------------
-        ``'sgcn'``     – softmax-weighted by validation score (default).
-        ``'avg'``      – uniform equal-weight average.
-        ``'weighted'`` – linear normalization by shifted validation score.
+        This implements Stage 2 of the SGCN algorithm:
+          1. Truncation  – discard the bottom ``truncation_ratio`` fraction of
+             subgraphs ranked by their validation score s_r (top-k by score).
+          2. Aggregation – compute a weighted average of the kept local
+             parameter dicts θ̂_r:
+               θ̃^(t) = Σ w_r * θ̂_r,   where w_r is determined by the
+               ``aggregation_method`` setting:
+               ``'sgcn'``     – softmax-weighted by validation score (default).
+               ``'avg'``      – uniform equal-weight average.
+               ``'weighted'`` – linear normalization by shifted validation score.
+
+        Parameters
+        ----------
+        epoch_init_state : dict
+            CPU snapshot of the global parameters at epoch start.  Used as a
+            key reference to iterate over all parameter names.
+        local_states : list of dict
+            One CPU state dict θ̂_r per valid subgraph, in the same order as
+            *val_scores*.
+        val_scores : list of float
+            Validation quality score s_r for each local model (higher = better).
+
+        Returns
+        -------
+        dict
+            Aggregated state dict θ̃^(t) (CPU tensors, same dtypes as input).
         """
-        kept_scores = torch.tensor(
-            [val_scores[i] for i in kept_idx], dtype=torch.float
-        )
+        # ── Truncation: keep top (1 − truncation_ratio) subgraphs ────────────
+        n_keep = max(1, int(len(local_states) * (1.0 - self._truncation_ratio)))
+        kept_idx = sorted(
+            range(len(val_scores)), key=lambda i: val_scores[i], reverse=True
+        )[:n_keep]
+
+        # ── Weighted aggregation of kept local parameters ─────────────────────
+        kept_scores = torch.tensor([val_scores[i] for i in kept_idx], dtype=torch.float)
 
         if self._aggregation_method == "avg":
             weights = torch.ones(len(kept_idx), dtype=torch.float) / len(kept_idx)
@@ -829,22 +1046,26 @@ class SGCNModelModule(ModelModule):
 
         return agg_state
 
-    # ── SGCN training step ────────────────────────────────────────────────────
+    # ── SGCN training step (orchestrates the two-stage algorithm) ─────────────
 
-    def training_step(self, batch, *args, **kwargs):  # noqa: C901
+    def training_step(self, batch, *args, **kwargs):
         """One SGCN training epoch.
 
         Receives the full graph as *batch* (obnbench's full-batch DataLoader
-        returns a single-graph Data each call).  The method:
+        returns a single-graph Data object each call).
 
-        1. Samples *n_subgraphs* subgraphs (with epoch-level coverage tracking).
-        2. For each subgraph:
-           a. Resets the model to ``epoch_init_state``.
-           b. Runs ``local_epochs`` gradient steps.
-           c. Scores the local model on a validation mini-batch.
-        3. Truncates the bottom ``truncation_ratio`` subgraphs by score.
-        4. Aggregates remaining local states and loads the result.
-        5. Logs ``train/loss`` and ``train/sgcn_*`` timing scalars.
+        The epoch is split into two explicit stages:
+
+        Stage 1 – Local training:
+          Sample R subgraphs {G_r} from the full graph (dynamic, this epoch).
+          For each subgraph G_r:
+            - Initialize from global parameters θ̃^(t-1)  [train_local_model]
+            - Train for L gradient steps → local parameters θ̂_r  [train_local_model]
+            - Score on a held-out validation mini-batch → s_r  [evaluate_submodel]
+
+        Stage 2 – Parameter aggregation:
+          Discard worst-scoring subgraphs (truncation), then compute a
+          weighted average of the remaining θ̂_r to produce θ̃^(t).  [aggregate_parameters]
         """
         device = self.device
         optimizer = self.optimizers()
@@ -872,104 +1093,48 @@ class SGCNModelModule(ModelModule):
         if n_subgraphs <= 0:
             n_subgraphs = math.ceil(n_nodes / n_sample)
 
-        # Snapshot epoch-start parameters (every subgraph resets to this)
+        # Snapshot global parameters θ̃^(t-1) before any local training.
+        # Every local model is initialized from this same snapshot.
         epoch_init_state = {k: v.clone().cpu() for k, v in self.state_dict().items()}
+
+        val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_cpu))
+
+        # ── Stage 1: Local training on sampled subgraphs ─────────────────────
+        # Dynamically sample R subgraphs for this epoch (coverage-aware).
+        subgraphs = self.sample_subgraphs(
+            batch, n_subgraphs, n_sample, edge_index_cpu, train_idx_cpu, device
+        )
 
         local_states: List[Dict[str, torch.Tensor]] = []
         val_scores: List[float] = []
         loss_sum = 0.0
-        valid_batches = 0
 
-        val_sample_size = min(_SGCN_VAL_SAMPLE_SIZE, len(val_idx_cpu))
-
-        # Epoch-level coverage mask: tracks which nodes have been visited.
-        # Successive subgraph samplers are biased toward unvisited nodes.
-        epoch_sampled_mask = torch.zeros(n_nodes, dtype=torch.bool)
-
-        for _sg in range(n_subgraphs):
-            # ── 1. Sample subgraph node indices ─────────────────────────────
-            unsampled = epoch_sampled_mask.logical_not().nonzero(as_tuple=False).squeeze(1)
-            unsampled_nodes = unsampled if len(unsampled) > 0 else None
-
-            node_idx = _sample_subgraph_nodes(
-                edge_index_cpu,
-                n_nodes,
-                train_idx_cpu,
-                self._subsampling_method,
-                n_sample,
-                subgraph_max_nodes=self._subgraph_max_nodes,
-                unsampled_nodes=unsampled_nodes,
+        for node_idx, sub_batch in subgraphs:
+            # Initialize local model from θ̃^(t-1), train for L steps → θ̂_r
+            local_state, last_loss = self.train_local_model(
+                sub_batch, optimizer, epoch_init_state, clip_val
             )
 
-            # Guarantee at least a few training nodes are in the subgraph
-            if not torch.isin(node_idx, train_idx_cpu).any():
-                extra = train_idx_cpu[
-                    torch.randperm(len(train_idx_cpu))[
-                        : min(_SGCN_MIN_TRAIN_NODES, len(train_idx_cpu))
-                    ]
-                ]
-                node_idx = torch.cat([node_idx, extra]).unique().sort().values
-
-            epoch_sampled_mask[node_idx] = True
-
-            # ── 2. Build subgraph Data object ────────────────────────────────
-            sub_batch = self._make_sub_batch(batch, node_idx).to(device)
-            train_mask_sub = sub_batch.train_mask.squeeze(-1)
-            if not train_mask_sub.any():
-                continue  # skip empty-training subgraph
-
-            # ── 3. Reset model to epoch-start; clear optimizer momentum ──────
-            self.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
-            optimizer.state.clear()
-            self.train()
-
-            # ── 4. L local gradient steps on fixed subgraph ──────────────────
-            last_loss = 0.0
-            for _le in range(self._local_epochs):
-                pred = self._forward_subgraph(sub_batch)
-                loss = F.binary_cross_entropy(
-                    pred[train_mask_sub], sub_batch.y[train_mask_sub]
-                )
-                optimizer.zero_grad()
-                self.manual_backward(loss)
-                if clip_val:
-                    self.clip_gradients(
-                        optimizer,
-                        gradient_clip_val=clip_val,
-                        gradient_clip_algorithm="norm",
-                    )
-                optimizer.step()
-                last_loss = loss.item()
-
-            loss_sum += last_loss
-            valid_batches += 1
-
-            # ── 5. Quick val score for truncation (no label leakage) ─────────
-            val_score = self._score_val_subgraph(
+            # Score local model quality on a validation mini-batch → s_r
+            val_score = self.evaluate_submodel(
                 batch, node_idx, val_idx_cpu, val_sample_size, device
             )
-            local_states.append({k: v.clone().cpu() for k, v in self.state_dict().items()})
-            val_scores.append(val_score)
 
-        # ── Fallback: restore epoch-start state if no subgraph was valid ────
+            local_states.append(local_state)
+            val_scores.append(val_score)
+            loss_sum += last_loss
+
+        # ── Stage 2: Parameter aggregation ───────────────────────────────────
         if not local_states:
+            # No valid subgraphs this epoch: keep global parameters unchanged
             self.load_state_dict({k: v.to(device) for k, v in epoch_init_state.items()})
             avg_loss = 0.0
         else:
-            # ── 6. Truncation: keep top (1 − truncation_ratio) subgraphs ────
-            n_keep = max(1, int(len(local_states) * (1.0 - self._truncation_ratio)))
-            kept_idx = sorted(
-                range(len(val_scores)), key=lambda i: val_scores[i], reverse=True
-            )[:n_keep]
-
-            # ── 7. Aggregate and load ────────────────────────────────────────
-            agg_state = self._aggregate_states(
-                epoch_init_state, local_states, val_scores, kept_idx
-            )
+            # Truncate worst subgraphs, then compute weighted average → θ̃^(t)
+            agg_state = self.aggregate_parameters(epoch_init_state, local_states, val_scores)
             self.load_state_dict({k: v.to(device) for k, v in agg_state.items()})
-            optimizer.state.clear()
-
-            avg_loss = loss_sum / valid_batches
+            optimizer.state.clear()  # discard momentum from local training steps
+            avg_loss = loss_sum / len(local_states)
 
         # ── Logging ──────────────────────────────────────────────────────────
         logger_opts = {
@@ -979,7 +1144,7 @@ class SGCNModelModule(ModelModule):
             "batch_size": n_nodes,
         }
         self.log("train/loss", avg_loss, **logger_opts)
-        self.log("train/sgcn_n_valid_subgraphs", float(valid_batches), **logger_opts)
+        self.log("train/sgcn_n_valid_subgraphs", float(len(local_states)), **logger_opts)
 
         return avg_loss
 
